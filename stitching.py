@@ -178,21 +178,29 @@ def build_output_canvas(img1_bchw: torch.Tensor, img2_bchw: torch.Tensor, H_21: 
 
 
 def blend_two_images(img1_warped: torch.Tensor, img2_warped: torch.Tensor,
-                      mask1: torch.Tensor, mask2: torch.Tensor) -> torch.Tensor:
+                     mask1: torch.Tensor, mask2: torch.Tensor) -> torch.Tensor:
     """
-    Blend two warped images together using their masks to handle overlaps.
-    Args:
-        img1_warped: warped image 1 in the output canvas frame
-        img2_warped: warped image 2 in the output canvas frame
-        mask1: binary mask indicating valid pixels in img1_warped
-        mask2: binary mask indicating valid pixels in img2_warped
-    Returns:
-        blended: blended output image
+    Blend two warped images while reducing foreground ghosting.
+    Strategy:
+      - if only one image has a valid pixel, use it
+      - if both are valid and similar, average them
+      - if both are valid but very different, prefer img1
     """
-    weight = mask1 + mask2
-    weight = torch.clamp(weight, min=1.0)
-    blended = (img1_warped * mask1 + img2_warped * mask2) / weight
-    return blended
+    only1 = mask1 * (1.0 - mask2)
+    only2 = mask2 * (1.0 - mask1)
+    both = mask1 * mask2
+
+    diff = torch.mean(torch.abs(img1_warped - img2_warped), dim=1, keepdim=True)
+
+    similar = (diff < 0.12).float()
+    different = 1.0 - similar
+
+    avg_part = ((img1_warped + img2_warped) / 2.0) * both * similar
+
+    choose1_part = img1_warped * both * different
+
+    out = img1_warped * only1 + img2_warped * only2 + avg_part + choose1_part
+    return out
 
 # main task 1 function
 def stitch_background(imgs: Dict[str, torch.Tensor]):
@@ -200,10 +208,8 @@ def stitch_background(imgs: Dict[str, torch.Tensor]):
     Args:
         imgs: input images are a dict of 2 images of torch.Tensor represent an input images for task-1.
     Returns:
-        img: stitched_image: torch.Tensor of the output image.
+        stitched: torch.Tensor of the stitched background image
     """
-    img = torch.zeros((3, 256, 256)) # assumed 256*256 resolution. Update this as per your logic.
-
     #TODO: Add your code here. Do not modify the return and input arguments.
     names = sorted(list(imgs.keys()))
     assert len(names) == 2, "Task 1 expects exactly two input images."
@@ -240,6 +246,13 @@ def stitch_background(imgs: Dict[str, torch.Tensor]):
 
     matched_pts1 = pts1_all[idxs[:, 0]]
     matched_pts2 = pts2_all[idxs[:, 1]]
+
+    # refine homography using only inliers
+    H_21 = K.geometry.find_homography_dlt(
+        matched_pts2.unsqueeze(0),
+        matched_pts1.unsqueeze(0)
+    )
+
 
     # estimating homography using RANSAC to find inliers
     H_21, inliers = compute_homography_ransac(matched_pts1, matched_pts2)
