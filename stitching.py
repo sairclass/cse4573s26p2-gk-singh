@@ -177,30 +177,39 @@ def build_output_canvas(img1_bchw: torch.Tensor, img2_bchw: torch.Tensor, H_21: 
     return out_h, out_w, T
 
 
-def blend_two_images(img1_warped: torch.Tensor, img2_warped: torch.Tensor,
-                     mask1: torch.Tensor, mask2: torch.Tensor) -> torch.Tensor:
+def blend_two_images(img1_warped, img2_warped, mask1, mask2):
     """
-    Blend two warped images while reducing foreground ghosting.
-    Strategy:
-      - if only one image has a valid pixel, use it
-      - if both are valid and similar, average them
-      - if both are valid but very different, prefer img1
+    Blend two warped images together using their masks to handle overlaps.
+    Args:
+        img1_warped: warped image 1
+        img2_warped: warped image 2
+        mask1: mask for image 1
+        mask2: mask for image 2
+    Returns:
+        blended_image: the blended image
     """
+
     only1 = mask1 * (1.0 - mask2)
     only2 = mask2 * (1.0 - mask1)
     both = mask1 * mask2
 
     diff = torch.mean(torch.abs(img1_warped - img2_warped), dim=1, keepdim=True)
 
-    similar = (diff < 0.12).float()
+    similar = (diff < 0.1).float()
     different = 1.0 - similar
 
     avg_part = ((img1_warped + img2_warped) / 2.0) * both * similar
 
-    choose1_part = img1_warped * both * different
+    choose1 = (torch.sum(img1_warped, dim=1, keepdim=True) <
+               torch.sum(img2_warped, dim=1, keepdim=True)).float()
 
-    out = img1_warped * only1 + img2_warped * only2 + avg_part + choose1_part
-    return out
+    choose2 = 1.0 - choose1
+
+    choose_part = (img1_warped * choose1 + img2_warped * choose2) * both * different
+
+    blended_image = img1_warped * only1 + img2_warped * only2 + avg_part + choose_part
+
+    return blended_image
 
 # main task 1 function
 def stitch_background(imgs: Dict[str, torch.Tensor]):
@@ -247,24 +256,21 @@ def stitch_background(imgs: Dict[str, torch.Tensor]):
     matched_pts1 = pts1_all[idxs[:, 0]]
     matched_pts2 = pts2_all[idxs[:, 1]]
 
-    # refine homography using only inliers
-    H_21 = K.geometry.find_homography_dlt(
-        matched_pts2.unsqueeze(0),
-        matched_pts1.unsqueeze(0)
-    )
-
-
-    # estimating homography using RANSAC to find inliers
+    # using RANSAC to find inliers
     H_21, inliers = compute_homography_ransac(matched_pts1, matched_pts2)
 
     if inliers.sum() < 4:
         return img1
 
+    # keep only inlier correspondences once
     matched_pts1 = matched_pts1[inliers]
     matched_pts2 = matched_pts2[inliers]
 
-    # computing the size of the output canvas and the translation homography
-    out_h, out_w, T = build_output_canvas(img1_bchw, img2_bchw, H_21)
+    # recompute homography using only inliers
+    H_21 = K.geometry.find_homography_dlt(
+        matched_pts2.unsqueeze(0),
+        matched_pts1.unsqueeze(0)
+    )
 
     # computing the size of the output canvas and the translation homography
     out_h, out_w, T = build_output_canvas(img1_bchw, img2_bchw, H_21)
