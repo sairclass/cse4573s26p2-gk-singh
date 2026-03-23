@@ -188,28 +188,32 @@ def blend_two_images(img1_warped, img2_warped, mask1, mask2):
     Returns:
         blended_image: the blended image
     """
+    overlap = mask1 * mask2
 
-    only1 = mask1 * (1.0 - mask2)
-    only2 = mask2 * (1.0 - mask1)
-    both = mask1 * mask2
+    # combining if no overlap
+    if overlap.sum() == 0:
+        return img1_warped * mask1 + img2_warped * mask2
 
-    diff = torch.mean(torch.abs(img1_warped - img2_warped), dim=1, keepdim=True)
+    # finding overlap region
+    coords = torch.nonzero(overlap[0, 0], as_tuple=False)
 
-    similar = (diff < 0.1).float()
-    different = 1.0 - similar
+    x_min = coords[:, 1].min().item()
+    x_max = coords[:, 1].max().item()
 
-    avg_part = ((img1_warped + img2_warped) / 2.0) * both * similar
+    seam_x = x_min + 0.6 * (x_max - x_min)
 
-    choose1 = (torch.sum(img1_warped, dim=1, keepdim=True) <
-               torch.sum(img2_warped, dim=1, keepdim=True)).float()
+    # building mask
+    _, _, H, W = img1_warped.shape
+    x_coords = torch.arange(W, device=img1_warped.device).view(1, 1, 1, W)
 
-    choose2 = 1.0 - choose1
+    mask_left = (x_coords <= seam_x).float()
+    mask_right = 1.0 - mask_left
 
-    choose_part = (img1_warped * choose1 + img2_warped * choose2) * both * different
+    # applying masks
+    img1_part = img1_warped * mask1 * mask_left
+    img2_part = img2_warped * mask2 * mask_right
 
-    blended_image = img1_warped * only1 + img2_warped * only2 + avg_part + choose_part
-
-    return blended_image
+    return img1_part + img2_part
 
 def compute_pairwise_homography(lafs1, desc1, lafs2, desc2, min_matches: int = 20, min_inliers: int = 15):
     """
