@@ -38,7 +38,7 @@ def extract_sift_features(gray_bchw: torch.Tensor, num_features: int = 800):
         lafs: local affine frames for the keypoints
         descs: SIFT descriptors for the keypoints 
     """
-    # SIFTFeature does detection + description
+    # SIFTFeature does detection and description in one step, returning local affine frames and descriptors
     sift = K.feature.SIFTFeature(num_features=num_features)
     lafs, responses, descs = sift(gray_bchw)
     return lafs, descs
@@ -211,6 +211,134 @@ def blend_two_images(img1_warped, img2_warped, mask1, mask2):
 
     return blended_image
 
+def compute_pairwise_homography(lafs1, desc1, lafs2, desc2, min_matches: int = 20, min_inliers: int = 15):
+    """
+    Compute the homography between two images given their local affine frames and descriptors.
+    Args:
+        lafs1: local affine frames for image 1
+        desc1: descriptors for image 1
+        lafs2: local affine frames for image 2
+        desc2: descriptors for image 2
+        min_matches: minimum number of matches required
+        min_inliers: minimum number of inliers required
+    Returns:
+        H_21: 1x3x3 homography or None
+        is_overlap: bool
+        num_inliers: int
+    """
+    distances, idxs = match_descriptors(desc1, desc2)
+
+    if idxs.shape[0] < min_matches:
+        return None, False, 0
+
+    pts1_all = lafs_to_center_points(lafs1)
+    pts2_all = lafs_to_center_points(lafs2)
+
+    matched_pts1 = pts1_all[idxs[:, 0]]
+    matched_pts2 = pts2_all[idxs[:, 1]]
+
+    H_21, inliers = compute_homography_ransac(matched_pts1, matched_pts2)
+
+    num_inliers = int(inliers.sum().item())
+    if num_inliers < min_inliers:
+        return None, False, num_inliers
+
+    matched_pts1 = matched_pts1[inliers]
+    matched_pts2 = matched_pts2[inliers]
+
+    H_21 = K.geometry.find_homography_dlt(
+        matched_pts2.unsqueeze(0),
+        matched_pts1.unsqueeze(0)
+    )
+
+    return H_21, True, num_inliers
+
+
+def invert_homography(H: torch.Tensor) -> torch.Tensor:
+    """
+    Invert a homography matrix.
+    Args:
+        H: 1x3x3 homography matrix
+    Returns:
+        H_inv: 1x3x3 inverted homography matrix
+    """
+    if H.dim() == 3:
+        H = H[0]
+    H_inv = torch.linalg.inv(H)
+    return H_inv.unsqueeze(0)
+
+
+def build_global_canvas(images_bchw, transforms_to_ref):
+    """
+    Compute the size of the output canvas needed to fit all images after warping, and the translation homography to shift everything into positive coordinates.
+    Args:
+        images_bchw: list of images in BCHW format
+        transforms_to_ref: list of homographies mapping each image to the reference frame
+    Returns:
+        out_h: height of the output canvas
+        out_w: width of the output canvas
+        T: translation homography
+    """
+    device = images_bchw[0].device
+    dtype = images_bchw[0].dtype
+
+    all_corners = []
+
+    for img_bchw, H in zip(images_bchw, transforms_to_ref):
+        if H is None:
+            continue
+        _, _, h, w = img_bchw.shape
+        corners = warp_corners(h, w, H, device, dtype)
+        all_corners.append(corners)
+
+    all_corners = torch.cat(all_corners, dim=0)
+
+    min_xy = torch.floor(all_corners.min(dim=0).values)
+    max_xy = torch.ceil(all_corners.max(dim=0).values)
+
+    min_x, min_y = min_xy[0], min_xy[1]
+    max_x, max_y = max_xy[0], max_xy[1]
+
+    tx = -min_x
+    ty = -min_y
+
+    T = torch.tensor(
+        [[[1.0, 0.0, tx],
+          [0.0, 1.0, ty],
+          [0.0, 0.0, 1.0]]],
+        device=device,
+        dtype=dtype
+    )
+
+    out_w = int((max_x - min_x + 1).item())
+    out_h = int((max_y - min_y + 1).item())
+
+    return out_h, out_w, T
+
+def blend_many_images(warped_images, warped_masks) -> torch.Tensor:
+    """
+    Blend multiple warped images together using their masks to handle overlaps.
+    Args:
+        warped_images: list of warped images
+        warped_masks: list of masks for the warped images
+    Returns:
+        blended_image: the blended image
+    """
+    acc_img = None
+    acc_mask = None
+
+    for img, mask in zip(warped_images, warped_masks):
+        if acc_img is None:
+            acc_img = img * mask
+            acc_mask = mask
+        else:
+            acc_img = acc_img + img * mask
+            acc_mask = acc_mask + mask
+
+    acc_mask = torch.clamp(acc_mask, min=1.0)
+    blended = acc_img / acc_mask
+    return blended
+
 # main task 1 function
 def stitch_background(imgs: Dict[str, torch.Tensor]):
     """
@@ -328,9 +456,122 @@ def panorama(imgs: Dict[str, torch.Tensor]):
         img: panorama, 
         overlap: torch.Tensor of the output image. 
     """
-    img = torch.zeros((3, 256, 256)) # assumed 256*256 resolution. Update this as per your logic.
-    overlap = torch.empty((3, 256, 256)) # assumed empty 256*256 overlap. Update this as per your logic.
+    # img = torch.zeros((3, 256, 256)) # assumed 256*256 resolution. Update this as per your logic.
+    # overlap = torch.empty((3, 256, 256)) # assumed empty 256*256 overlap. Update this as per your logic.
 
     #TODO: Add your code here. Do not modify the return and input arguments.
+    names = sorted(list(imgs.keys()))
+    n = len(names)
 
-    return img, overlap
+    if n == 0:
+        img = torch.zeros((3, 256, 256), dtype=torch.uint8)
+        overlap = torch.zeros((0, 0), dtype=torch.int64)
+        return img, overlap
+
+    # Initializing images, grayscale, features
+    images_bchw = []
+    lafs_list = []
+    desc_list = []
+
+    for name in names:
+        img = imgs[name]
+        img_bchw = to_float_bchw(img)
+        gray = to_grayscale(img_bchw)
+        lafs, descs = extract_sift_features(gray, num_features=1000)
+
+        images_bchw.append(img_bchw)
+        lafs_list.append(lafs)
+        desc_list.append(descs[0])  # remove batch dim
+
+    # overlapping matrix and homographies pairwise
+    overlap = torch.eye(n, dtype=torch.int64)
+    pair_H = [[None for _ in range(n)] for _ in range(n)]
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            H_ji, is_overlap, num_inliers = compute_pairwise_homography(
+                lafs_list[i], desc_list[i],
+                lafs_list[j], desc_list[j],
+                min_matches=20,
+                min_inliers=15
+            )
+
+            if is_overlap:
+                overlap[i, j] = 1
+                overlap[j, i] = 1
+
+                pair_H[i][j] = H_ji
+                pair_H[j][i] = invert_homography(H_ji)
+
+    # choosing reference image as the one with most overlaps
+    degrees = overlap.sum(dim=1)
+    ref_idx = int(torch.argmax(degrees).item())
+
+    # computing homographies to the reference frame using BFS
+    transforms_to_ref = [None for _ in range(n)]
+    transforms_to_ref[ref_idx] = torch.eye(3, dtype=images_bchw[0].dtype, device=images_bchw[0].device).unsqueeze(0)
+
+    visited = [False for _ in range(n)]
+    queue = [ref_idx]
+    visited[ref_idx] = True
+
+    while len(queue) > 0:
+        cur = queue.pop(0)
+
+        for nxt in range(n):
+            if pair_H[cur][nxt] is None:
+                continue
+            if visited[nxt]:
+                continue
+
+            transforms_to_ref[nxt] = transforms_to_ref[cur] @ pair_H[cur][nxt]
+            visited[nxt] = True
+            queue.append(nxt)
+
+    # keeping only connected images
+    connected_indices = [i for i in range(n) if transforms_to_ref[i] is not None]
+
+    if len(connected_indices) == 0:
+        img = imgs[names[0]]
+        return img, overlap
+
+    # building output canvas from connected images only
+    connected_images = [images_bchw[i] for i in connected_indices]
+    connected_transforms = [transforms_to_ref[i] for i in connected_indices]
+
+    out_h, out_w, T = build_global_canvas(connected_images, connected_transforms)
+
+    warped_images = []
+    warped_masks = []
+
+    for i in connected_indices:
+        img_bchw = images_bchw[i]
+        H = T @ transforms_to_ref[i]
+
+        warped = K.geometry.transform.warp_perspective(
+            img_bchw, H, dsize=(out_h, out_w),
+            mode="bilinear", padding_mode="zeros", align_corners=True
+        )
+
+        mask = torch.ones(
+            (1, 1, img_bchw.shape[-2], img_bchw.shape[-1]),
+            dtype=img_bchw.dtype,
+            device=img_bchw.device
+        )
+
+        warped_mask = K.geometry.transform.warp_perspective(
+            mask, H, dsize=(out_h, out_w),
+            mode="nearest", padding_mode="zeros", align_corners=True
+        )
+
+        warped_mask = (warped_mask > 0.5).float()
+
+        warped_images.append(warped)
+        warped_masks.append(warped_mask)
+
+    panorama_image = blend_many_images(warped_images, warped_masks)
+
+    panorama_image = panorama_image.squeeze(0).clamp(0.0, 1.0)
+    panorama_image = (panorama_image * 255.0).round().to(torch.uint8)
+
+    return panorama_image, overlap
