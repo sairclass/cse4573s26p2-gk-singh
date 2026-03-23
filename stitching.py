@@ -5,6 +5,7 @@ Notes:
 3. If you want to show an image for debugging, please use show_image() function in util.py. 
 4. Please do NOT save any intermediate files in your final submission.
 '''
+from numpy import degrees
 import torch
 import kornia as K
 from typing import Dict
@@ -18,13 +19,13 @@ Please do NOT add any imports. The allowed libraries are already imported for yo
 
 # helper functions for task 1
 def to_float_bchw(img: torch.Tensor) -> torch.Tensor:
-    # Convert image to float and add batch dimension
+    # converting image to float and add batch dimension
     if img.dtype != torch.float32:
         img = img.float() / 255.0
     return img.unsqueeze(0)
 
 def to_grayscale(img_bchw: torch.Tensor) -> torch.Tensor:
-    # Convert RGB image to grayscale for feature extraction
+    # converting RGB image to grayscale for feature extraction
     return K.color.rgb_to_grayscale(img_bchw)
 
 def extract_sift_features(gray_bchw: torch.Tensor, num_features: int = 800):
@@ -38,7 +39,6 @@ def extract_sift_features(gray_bchw: torch.Tensor, num_features: int = 800):
         lafs: local affine frames for the keypoints
         descs: SIFT descriptors for the keypoints 
     """
-    # SIFTFeature does detection and description in one step, returning local affine frames and descriptors
     sift = K.feature.SIFTFeature(num_features=num_features)
     lafs, responses, descs = sift(gray_bchw)
     return lafs, descs
@@ -250,6 +250,7 @@ def compute_pairwise_homography(lafs1, desc1, lafs2, desc2, min_matches: int = 2
         matched_pts2.unsqueeze(0),
         matched_pts1.unsqueeze(0)
     )
+    H_21 = make_affine(H_21)
 
     return H_21, True, num_inliers
 
@@ -315,7 +316,7 @@ def build_global_canvas(images_bchw, transforms_to_ref):
 
     return out_h, out_w, T
 
-def blend_many_images(warped_images, warped_masks) -> torch.Tensor:
+def blend_multi_image(warped_images, warped_masks) -> torch.Tensor:
     """
     Blend multiple warped images together using their masks to handle overlaps.
     Args:
@@ -338,6 +339,36 @@ def blend_many_images(warped_images, warped_masks) -> torch.Tensor:
     acc_mask = torch.clamp(acc_mask, min=1.0)
     blended = acc_img / acc_mask
     return blended
+
+def normalize_homography(H: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize a homography matrix so that the bottom-right value is 1.
+    Args:
+        H: 1x3x3 or 3x3 homography matrix
+    Returns:
+        H_normalized: normalized homography matrix
+    """
+    if H.dim() == 3:
+        H = H[0]
+    H = H / H[2, 2].clamp(min=1e-8)
+    return H.unsqueeze(0)
+
+def make_affine(H: torch.Tensor) -> torch.Tensor:
+    """
+    Convert a homography to an affine transformation by zeroing out the projective components.
+    Args:
+        H: 1x3x3 or 3x3 homography matrix
+    Returns:
+        H_affine: 1x3x3 affine transformation matrix
+    """
+    if H.dim() == 3:
+        H = H[0]
+
+    H[2, 0] = 0.0
+    H[2, 1] = 0.0
+    H[2, 2] = 1.0
+
+    return H.unsqueeze(0)
 
 # main task 1 function
 def stitch_background(imgs: Dict[str, torch.Tensor]):
@@ -503,9 +534,9 @@ def panorama(imgs: Dict[str, torch.Tensor]):
                 pair_H[i][j] = H_ji
                 pair_H[j][i] = invert_homography(H_ji)
 
-    # choosing reference image as the one with most overlaps
-    degrees = overlap.sum(dim=1)
-    ref_idx = int(torch.argmax(degrees).item())
+    # determining reference frame
+    ref_degree = overlap.sum(dim=1)
+    ref_idx = int(torch.argmax(ref_degree))
 
     # computing homographies to the reference frame using BFS
     transforms_to_ref = [None for _ in range(n)]
@@ -524,7 +555,16 @@ def panorama(imgs: Dict[str, torch.Tensor]):
             if visited[nxt]:
                 continue
 
-            transforms_to_ref[nxt] = transforms_to_ref[cur] @ pair_H[cur][nxt]
+            if pair_H[ref_idx][nxt] is not None:
+                H_direct = normalize_homography(pair_H[ref_idx][nxt])
+                transforms_to_ref[nxt] = make_affine(H_direct)
+            else:
+                H_new = transforms_to_ref[cur] @ pair_H[cur][nxt]
+                H_new = normalize_homography(H_new)
+                H_new = make_affine(H_new)
+
+                transforms_to_ref[nxt] = H_new
+
             visited[nxt] = True
             queue.append(nxt)
 
@@ -534,6 +574,12 @@ def panorama(imgs: Dict[str, torch.Tensor]):
     if len(connected_indices) == 0:
         img = imgs[names[0]]
         return img, overlap
+    
+    valid = torch.zeros_like(overlap)
+    for i in connected_indices:
+        for j in connected_indices:
+            valid[i, j] = overlap[i, j]
+    overlap = valid
 
     # building output canvas from connected images only
     connected_images = [images_bchw[i] for i in connected_indices]
@@ -569,7 +615,7 @@ def panorama(imgs: Dict[str, torch.Tensor]):
         warped_images.append(warped)
         warped_masks.append(warped_mask)
 
-    panorama_image = blend_many_images(warped_images, warped_masks)
+    panorama_image = blend_multi_image(warped_images, warped_masks)
 
     panorama_image = panorama_image.squeeze(0).clamp(0.0, 1.0)
     panorama_image = (panorama_image * 255.0).round().to(torch.uint8)
