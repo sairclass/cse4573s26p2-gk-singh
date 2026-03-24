@@ -17,15 +17,27 @@ Please do NOT add any imports. The allowed libraries are already imported for yo
 
 # ------------------------------------ Task 1 ------------------------------------ #
 
-# helper functions for task 1
+# helper functions
 def to_float_bchw(img: torch.Tensor) -> torch.Tensor:
-    # converting image to float and add batch dimension
+    '''
+    Convert image to float and add batch dimension.
+    Args:
+        img: CxHxW image tensor
+    Returns:
+        img: 1xCxHxW image tensor
+    '''
     if img.dtype != torch.float32:
         img = img.float() / 255.0
     return img.unsqueeze(0)
 
 def to_grayscale(img_bchw: torch.Tensor) -> torch.Tensor:
-    # converting RGB image to grayscale for feature extraction
+    '''
+    Convert RGB image to grayscale for feature extraction.
+    Args:
+        img_bchw: RGB image in 1xCxHxW format
+    Returns:
+        gray_bchw: grayscale image in 1x1xHxW format
+    '''
     return K.color.rgb_to_grayscale(img_bchw)
 
 def extract_sift_features(gray_bchw: torch.Tensor, num_features: int = 800):
@@ -254,10 +266,8 @@ def compute_pairwise_homography(lafs1, desc1, lafs2, desc2, min_matches: int = 2
         matched_pts2.unsqueeze(0),
         matched_pts1.unsqueeze(0)
     )
-    H_21 = make_affine(H_21)
 
     return H_21, True, num_inliers
-
 
 def invert_homography(H: torch.Tensor) -> torch.Tensor:
     """
@@ -271,7 +281,6 @@ def invert_homography(H: torch.Tensor) -> torch.Tensor:
         H = H[0]
     H_inv = torch.linalg.inv(H)
     return H_inv.unsqueeze(0)
-
 
 def build_global_canvas(images_bchw, transforms_to_ref):
     """
@@ -327,22 +336,72 @@ def blend_multi_image(warped_images, warped_masks) -> torch.Tensor:
         warped_images: list of warped images
         warped_masks: list of masks for the warped images
     Returns:
-        blended_image: the blended image
+        blended: the blended image
     """
-    acc_img = None
-    acc_mask = None
+    imgs = torch.cat(warped_images, dim=0)
+    masks = torch.cat(warped_masks, dim=0)
 
-    for img, mask in zip(warped_images, warped_masks):
-        if acc_img is None:
-            acc_img = img * mask
-            acc_mask = mask
+    K, _, H, W = imgs.shape
+
+    # coordinate grid
+    y, x = torch.meshgrid(
+        torch.arange(H, device=imgs.device),
+        torch.arange(W, device=imgs.device),
+        indexing="ij"
+    )
+    y = y.float()
+    x = x.float()
+
+    # approximating center of each warped image
+    centers = []
+    for i in range(K):
+        mask = masks[i, 0]
+        ys, xs = torch.where(mask > 0.5)
+        if ys.numel() == 0:
+            centers.append((H / 2.0, W / 2.0))
         else:
-            acc_img = acc_img + img * mask
-            acc_mask = acc_mask + mask
+            centers.append((ys.float().mean(), xs.float().mean()))
 
-    acc_mask = torch.clamp(acc_mask, min=1.0)
-    blended = acc_img / acc_mask
-    return blended
+    # distance to center score for each image
+    dist_stack = []
+    for i in range(K):
+        cy, cx = centers[i]
+        dist = (y - cy) ** 2 + (x - cx) ** 2
+        dist_stack.append(dist.unsqueeze(0))
+    dist_stack = torch.cat(dist_stack, dim=0)
+
+    # ignoring invalid pixels by setting them to a large distance
+    dist_stack = dist_stack + (1.0 - masks[:, 0]) * 1e10
+
+    # tracking best and second best sources per pixel
+    sorted_dist, sorted_idx = torch.sort(dist_stack, dim=0)
+    best_idx = sorted_idx[0]
+    second_idx = sorted_idx[1]
+
+    # gathering best image
+    best_idx_rgb = best_idx.unsqueeze(0).unsqueeze(0).expand(1, 3, H, W)
+    best_img = torch.gather(imgs, dim=0, index=best_idx_rgb).squeeze(0)
+
+    # gathering second best image
+    second_idx_rgb = second_idx.unsqueeze(0).unsqueeze(0).expand(1, 3, H, W)
+    second_img = torch.gather(imgs, dim=0, index=second_idx_rgb).squeeze(0)
+
+    # calculating confidence for seam
+    margin = sorted_dist[1] - sorted_dist[0]
+
+    # applying small margin band around seams
+    margin_width = 4500.0
+    alpha = torch.clamp(margin / margin_width, 0.0, 1.0)
+    alpha = alpha.unsqueeze(0)
+
+    # mixing best and second best
+    blended = best_img * alpha + second_img * (1.0 - alpha)
+
+    # zeroing out pixels where nothing is valid
+    valid = (masks.sum(dim=0) > 0).float()
+    blended = blended * valid.expand_as(blended)
+
+    return blended.unsqueeze(0)
 
 def normalize_homography(H: torch.Tensor) -> torch.Tensor:
     """
@@ -380,7 +439,7 @@ def stitch_background(imgs: Dict[str, torch.Tensor]):
     Args:
         imgs: input images are a dict of 2 images of torch.Tensor represent an input images for task-1.
     Returns:
-        stitched: torch.Tensor of the stitched background image
+        img: torch.Tensor of the stitched background image
     """
     #TODO: Add your code here. Do not modify the return and input arguments.
     names = sorted(list(imgs.keys()))
@@ -474,13 +533,13 @@ def stitch_background(imgs: Dict[str, torch.Tensor]):
     mask2_warped = (mask2_warped > 0.5).float()
 
     # blending the two warped images together using their masks to handle overlaps
-    stitched = blend_two_images(img1_warped, img2_warped, mask1_warped, mask2_warped)
+    img = blend_two_images(img1_warped, img2_warped, mask1_warped, mask2_warped)
 
     # converting back to uint8 format and removing batch dimension
-    stitched = stitched.squeeze(0).clamp(0.0, 1.0)
-    stitched = (stitched * 255.0).round().to(torch.uint8)
+    img = img.squeeze(0).clamp(0.0, 1.0)
+    img = (img * 255.0).round().to(torch.uint8)
 
-    return stitched
+    return img
 
 # ------------------------------------ Task 2 ------------------------------------ #
 def panorama(imgs: Dict[str, torch.Tensor]):
@@ -560,14 +619,10 @@ def panorama(imgs: Dict[str, torch.Tensor]):
                 continue
 
             if pair_H[ref_idx][nxt] is not None:
-                H_direct = normalize_homography(pair_H[ref_idx][nxt])
-                transforms_to_ref[nxt] = make_affine(H_direct)
+                transforms_to_ref[nxt] = normalize_homography(pair_H[ref_idx][nxt])
             else:
                 H_new = transforms_to_ref[cur] @ pair_H[cur][nxt]
-                H_new = normalize_homography(H_new)
-                H_new = make_affine(H_new)
-
-                transforms_to_ref[nxt] = H_new
+                transforms_to_ref[nxt] = normalize_homography(H_new)
 
             visited[nxt] = True
             queue.append(nxt)
@@ -619,9 +674,9 @@ def panorama(imgs: Dict[str, torch.Tensor]):
         warped_images.append(warped)
         warped_masks.append(warped_mask)
 
-    panorama_image = blend_multi_image(warped_images, warped_masks)
+    img = blend_multi_image(warped_images, warped_masks)
 
-    panorama_image = panorama_image.squeeze(0).clamp(0.0, 1.0)
-    panorama_image = (panorama_image * 255.0).round().to(torch.uint8)
+    img = img.squeeze(0).clamp(0.0, 1.0)
+    img = (img * 255.0).round().to(torch.uint8)
 
-    return panorama_image, overlap
+    return img, overlap
